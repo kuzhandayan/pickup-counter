@@ -1,166 +1,167 @@
 # Pickup Counter
 
-A small self-service counter: the customer picks snacks, pays by UPI, and collects from a locker.
-Backend in Express + PostgreSQL, customer screen in React (Vite), all TypeScript.
+A small self-service snack counter. The customer picks items on a screen, pays by UPI, and collects the order from a locker.
 
-## Run it
+- Backend: Node.js + Express + PostgreSQL (TypeScript)
+- Customer screen: React + Vite (TypeScript)
+- Tests: Vitest, against a real Postgres database
+
+## How to run
+
+You only need Docker.
 
 ```bash
 docker compose up --build
 ```
 
-Open http://localhost:8080. The same server serves the customer screen and the API (e.g. http://localhost:8080/products).
+Then open http://localhost:8080.
 
-Postgres is also on `localhost:5433` (database `pickup`, user and password `postgres`) if you want to look at the data.
+This starts two containers:
 
-There are two containers: `db` (Postgres) and `app` (the Express API, which also serves the built React screen). On start, the app waits for Postgres, runs migrations and seeds five products.
+- `db` - Postgres. Also open on `localhost:5433` (database `pickup`, user `postgres`, password `postgres`) if you want to look at the data in DBeaver or psql.
+- `app` - the Express API. It also serves the built React screen, so the screen and the API are on the same port.
 
-### Simulate a payment
+On first start the app waits for Postgres, creates the tables and adds 5 products.
 
-There is no real provider, so after placing an order, send a signed webhook yourself. The payment screen shows this command with the order ID filled in.
+To stop: `docker compose down` (this also clears the data).
 
-```bash
-docker compose exec app npm run send-webhook -- <orderId>                 # pays the exact total
-docker compose exec app npm run send-webhook -- <orderId> --event evt_1   # run twice: second one is a no-op
-docker compose exec app npm run send-webhook -- <orderId> 100             # wrong amount -> needs_review
-docker compose exec app npm run send-webhook -- <orderId> --status failed # ignored, order stays pending
-docker compose exec app npm run send-webhook -- <orderId> --bad-signature # rejected with 401
-```
+## How to try it
 
-### Simulate the locker
+There is no real payment provider, so you send the payment webhook yourself with a script. The full list of commands is in [COMMANDS.md](COMMANDS.md). The short version:
 
-```bash
-curl -X POST http://localhost:8080/orders/<orderId>/pickup-claim
-```
+1. Open http://localhost:8080, add some items and click **Place order**.
+2. Copy the order ID. The payment screen shows the exact command under "Testing: simulate the payment".
+3. Pay it (within 2 minutes):
+   ```bash
+   docker compose exec app npm run send-webhook -- <orderId>
+   ```
+   The screen changes to "Payment received".
+4. Collect it, as the locker would:
+   ```bash
+   curl -X POST http://localhost:8080/orders/<orderId>/pickup-claim
+   ```
+   Run it again and you get `409 already_picked_up`.
 
-## Run the tests
+The webhook script can also send a wrong amount, a failed payment, a bad signature, or the same event twice. See COMMANDS.md.
 
-With the app running, the backend tests run inside the app container against the real Postgres. They use a separate `pickup_test` database (created automatically), so the app's data is not touched.
+## How to run the tests
+
+Backend (20 tests, real Postgres), with the app running:
 
 ```bash
 docker compose exec app npm test
 ```
 
-Without Docker, point them at any Postgres:
+The tests use their own database, `pickup_test`, which is created automatically. They don't touch the app's data.
 
-```bash
-cd backend && npm install
-DATABASE_URL=postgres://postgres:postgres@localhost:5432/pickup npm test
-```
-
-Frontend tests (countdown and status messages, no database needed):
+Frontend (3 tests for the countdown and status messages, no database needed):
 
 ```bash
 cd frontend && npm install && npm test
 ```
 
-### Local development without Docker
-
-```bash
-cd backend && npm install && DATABASE_URL=postgres://postgres:postgres@localhost:5432/pickup npm run dev   # API on :3000
-cd frontend && npm install && npm run dev                                                                  # screen on :5173
-```
-
 ## API
 
-| Method | Path | Notes |
+| Method | Path | What it does |
 |---|---|---|
-| GET | `/products` | Each product with `availableUnits` |
-| POST | `/orders` | `{ items: [{ productId, quantity }] }` → 201 with `totalPaise`, `expiresInSeconds`. 409 `insufficient_stock` if anything is short |
-| GET | `/orders/:id` | Current status and `expiresInSeconds` |
-| POST | `/payments/webhook` | Needs `X-Signature` = hex HMAC-SHA256 of the raw body with `WEBHOOK_SECRET` |
-| POST | `/orders/:id/pickup-claim` | 200 once; 409 `already_picked_up` or `order_not_paid` |
+| GET | `/products` | Products with `availableUnits` |
+| POST | `/orders` | Body `{ "items": [{ "productId": 1, "quantity": 2 }] }`. Returns 201 with `totalPaise` and `expiresInSeconds`, or 409 `insufficient_stock` |
+| GET | `/orders/:id` | Order status and `expiresInSeconds` |
+| POST | `/payments/webhook` | Needs header `X-Signature` (hex HMAC-SHA256 of the raw body) |
+| POST | `/orders/:id/pickup-claim` | 200 the first time, 409 after that or if the order isn't paid |
 
 Order statuses: `pending`, `paid`, `expired`, `needs_review`, `picked_up`.
 
-## How it works and why
+Money is always stored as whole paise (integers).
+
+## Decisions
 
 ### Stock and holds
 
-There is no separate "held" counter. A hold is just an order row with an `expires_at`. Available units are worked out from the orders:
+I don't keep a separate "held" counter. A hold is just an order with an `expires_at` time. Available units are calculated:
 
 ```
-available = stock - (units in pending orders whose hold has not run out) - (units in paid orders not yet collected)
+available = stock
+          - units in pending orders that haven't expired yet
+          - units in paid orders not collected yet
 ```
 
-Paid orders keep their units reserved because stock only goes down at pickup (as the brief asks). This lives in one SQL view, `reserved_units`.
+This is the `reserved_units` view in the migration.
 
-Because availability is calculated from `expires_at`, a hold frees its units the moment it runs out. No background job has to run first. There is a sweep every 5 seconds, but it only changes the status label to `expired`; correctness does not depend on it. `GET /orders/:id` also expires a stale order when it is read.
+Because of this, when a hold runs out, the units are free straight away. Nothing has to run first. There is a small job every 5 seconds that changes the label to `expired`, but stock is correct even if that job is late or stopped.
 
-I chose this over keeping an "available" column and decrementing it, because then every expiry would need a job to add units back, and a missed or late job would leave stock stuck.
+Paid orders keep holding their units until pickup, because stock only goes down at pickup.
 
-### Concurrency
+### Two people buying the last units at the same time
 
-Every action that can change availability (placing an order, accepting a late payment, pickup) first locks the affected product rows with `SELECT ... FOR UPDATE`, always in product-id order so two transactions cannot deadlock. Then it reads availability in a **separate statement**. This matters: in Postgres READ COMMITTED, each statement gets a fresh snapshot, so the second statement sees holds committed by whoever had the lock before. If you read availability in the same statement as the lock, you can get the old snapshot and oversell.
+Placing an order, accepting a late payment, and pickup all start by locking the product rows (`SELECT ... FOR UPDATE`), always in product id order so two requests can't deadlock.
 
-As a last guard, `products.stock` has `CHECK (stock >= 0)`.
+After the lock, availability is read in a **separate** query. This matters in Postgres: each query sees data committed before it started, so the second query sees holds created by whoever had the lock before. If it were the same query as the lock, it could read old data and oversell.
 
-### One clock
+There is also `CHECK (stock >= 0)` on the table as a last safety net.
 
-All time decisions use the database clock (`clock_timestamp()`): setting `expires_at`, checking whether a hold is still valid, and computing `expiresInSeconds`. The Node process clock is never used for this, so the API server and the DB cannot disagree.
+### Time
+
+All "has the hold expired?" checks use the database clock, not the Node server clock, so there is only one clock to trust.
 
 ### Payment webhook
 
-- The route reads the **raw bytes** (`express.raw`) and checks the HMAC on them with a timing-safe compare. Parsing to JSON first and re-serialising would change the bytes and break the signature.
-- **Idempotency**: `payment_events.event_id` is the primary key. Inserting the event and updating the order happen in one transaction, so an event is either fully processed or not at all. A repeated event inserts nothing and gets back the outcome from the first time (`duplicate: true`). The order row is locked first, so even copies that arrive at the same moment are handled one after another.
-- **Wrong amount** → `needs_review` (reason `amount_mismatch`). The units are released. A later correct payment for the same order is recorded but does not flip it to paid; a person should look at it.
-- **Status other than `captured`** (e.g. `failed`) → recorded, order unchanged. The customer can still pay within the hold.
-- **Unknown order** → 404 and nothing is recorded.
+- **Signature:** checked against the raw request bytes. If you parse the JSON and turn it back into a string, the bytes can change and the signature won't match.
+- **Same event twice:** `eventId` is the primary key of `payment_events`. Saving the event and updating the order happen in one transaction. A repeat inserts nothing and gets back the first result with `duplicate: true`. The order row is locked first, so even copies that arrive at the same moment are handled one at a time.
+- **Wrong amount:** the order becomes `needs_review` and is not marked paid. Its units are released. A later correct payment for the same order doesn't flip it to paid; someone should look at it.
+- **Status other than `captured`** (like `failed`): saved, order not changed. The customer can still pay before the hold ends.
 
-### Decision: payment that arrives after the hold expired
+### Payment that arrives after the hold expired
 
-The money has already left the customer's account, so I try to complete the sale, but never by overselling:
+The brief left this open. What I chose:
 
-1. Lock the order and its products, and check the hold against the DB clock.
-2. If the hold is over, mark the order expired (so it stops counting as its own reservation), then check whether its units are still free.
-3. **Units still free** → mark it `paid` (outcome `paid_after_expiry`). The customer gets their snacks; nobody is affected.
-4. **Units gone** → `needs_review` with reason `late_payment_no_stock`. Staff refund the customer. The person who bought the units in the meantime keeps them.
+- **If the units are still free** - accept it and mark the order `paid`. The customer has already paid, and nobody else is affected.
+- **If the units were sold to someone else** - mark it `needs_review` (reason `late_payment_no_stock`). Staff refund the customer. The person who bought the units in between keeps them.
 
-Why: refusing an order we can still fill makes a customer chase a refund for nothing. But stock correctness comes first, so when we can't fill it, a human handles the refund. Automatic refunds would need a provider refund API, which is out of scope here.
+Why: rejecting a payment for an order we can still fill just makes the customer chase a refund. But I never oversell to do it. Automatic refunds would need the provider's refund API, which isn't part of this task.
 
-The "is the hold still valid?" check happens only after the product locks are held. Placing an order takes the same locks, so a late payment and a new order for the same units can never both win.
+The "is the hold over?" check happens after the product rows are locked. Placing an order takes the same locks, so a late payment and a new order can never both get the same units.
 
 ### Pickup
 
 ```sql
-UPDATE orders SET status = 'picked_up' WHERE id = $1 AND status = 'paid' RETURNING id
+UPDATE orders SET status = 'picked_up' WHERE id = $1 AND status = 'paid'
 ```
 
-If two lockers call at the same time, the second waits on the row lock. When the first commits, Postgres re-checks `status = 'paid'` for the second, finds `picked_up`, and updates nothing → 409. Stock is reduced in the same transaction, so a claim and its stock change commit together.
+If two lockers call at the same time, the second one waits for the first. After the first commits, Postgres checks the condition again for the second, sees `picked_up`, updates nothing, and the API returns 409. The stock goes down in the same transaction.
 
-### Customer screen and the wrong clock
+### Countdown when the counter's clock is wrong
 
-The kiosk clock can be minutes off, so the screen never compares against a timestamp. It takes `expiresInSeconds` from the server and counts down with `performance.now()`, a monotonic timer that only measures elapsed time and ignores the device's wall clock (even if someone changes it mid-countdown). Every poll (every 2 s) re-syncs the countdown.
+The screen never compares with a date or time from the server. It takes `expiresInSeconds` and counts down using `performance.now()`, which only measures time passed and ignores the device clock (even if someone changes the clock in between). Each poll (every 2 seconds) corrects it again.
 
-The countdown is anchored to when the request was **sent**, not received, so it can only show slightly less time than the real hold, never more. When it reaches zero, the screen shows "Checking payment status…" and waits for the server to say `expired` or `paid`; the browser never decides that on its own.
+The countdown starts from when the request was **sent**, so it can only show slightly less time than the real hold, never more. When it reaches zero, the screen shows "Checking payment status…" and waits for the server to say `expired` or `paid`. The screen never decides that on its own.
 
 ## Assumptions
 
-- `eventId` identifies an event. A repeat with the same id is the same event, even if the body differs.
-- Amount must match the order total exactly; there is no tolerance.
-- The price is copied onto the order line when the order is placed, so later price changes don't affect it.
-- No authentication: the counter, lockers and API are on a private network. The webhook is the only route with a signature.
-- A `needs_review` order holds no stock. Staff resolve it outside this app.
-- An expired order can't be revived by the customer; they place a new one. Only a late payment can bring it back (see above).
-- Max 100 units per line and 50 lines per order, just to stop silly input.
+- `eventId` identifies an event. A repeat with the same id is treated as the same event.
+- The amount must match the total exactly.
+- The price is copied onto the order when it is placed, so later price changes don't affect it.
+- No login. The counter, lockers and API are on a private network. Only the webhook is signed.
+- A `needs_review` order holds no stock. Staff handle it outside this app.
+- An expired order can't be paid again by the customer from the screen; they place a new one. Only a late webhook can still complete it (see above).
+- Limits: up to 100 units per item and 50 items per order.
 
 ## How I checked it
 
-- **Automated tests against real Postgres** (`backend/tests`, 20 tests), including the three required ones:
-  - 10 customers ordering the last 2 units at once → exactly 2 orders succeed, the other 8 get 409, and the database shows exactly 2 units held. Run 5 rounds in a row to make a lucky pass less likely.
-  - The same webhook event sent twice, and 5 copies at the same moment → processed once, one row in `payment_events`, `paid_at` unchanged.
-  - 2 (and 10) simultaneous pickup claims → exactly one 200; stock drops once.
-  - Also: wrong signature, wrong amount, non-captured status, late payment with and without stock, expiry freeing units, unpaid/expired pickup.
-- **Checking the tests can fail**: I removed `FOR UPDATE` from the product lock and the two concurrent-order tests failed. I removed the `status = 'paid'` guard from pickup and both concurrent-pickup tests failed. Then I restored the code and all tests passed again.
-- **Frontend tests** (`frontend/src/PaymentScreen.test.tsx`): device clock set 7 minutes ahead, then moved back 20 minutes mid-countdown; the countdown still reads 2:00 → 1:30 → 1:20. When I swapped the timer to `Date.now()`, this test failed.
-- **Manually** with curl and the webhook script: order, duplicate webhook, bad signature, pickup twice, stock after pickup.
+- **Automated tests against real Postgres** (`backend/tests`), including the three from the brief:
+  - 10 customers ordering the last 2 units at once: exactly 2 orders succeed, 8 get 409, and the database shows exactly 2 units held. This runs 5 rounds so a lucky pass is less likely.
+  - The same webhook sent twice, and 5 copies at the same moment: processed once.
+  - 2 (and 10) pickup claims at the same moment: exactly one succeeds, stock goes down once.
+  - Also: bad signature, wrong amount, failed status, late payment with and without stock, expiry freeing units, pickup of unpaid or expired orders.
+- **Checking that the tests can actually fail:** I removed `FOR UPDATE` from the product lock and the concurrent order tests failed. I removed the `status = 'paid'` check from pickup and the concurrent pickup tests failed. I changed the countdown to use `Date.now()` and the wrong-clock test failed. Then I put the code back.
+- **By hand on the running app:** placed orders on the screen, paid with the webhook script, sent duplicates, a wrong amount and a bad signature, claimed pickup twice, and checked the tables in DBeaver.
 
 ## What I would do next
 
-- Operator screen for `needs_review` orders, and refunds through the provider's API.
-- Reconciliation: periodically compare our paid orders with the provider's settlement report.
-- Authenticate lockers (signed requests or mTLS) instead of trusting the network.
-- OpenAPI spec and generated client types for the frontend.
+- A staff screen for `needs_review` orders, with refunds through the provider's API.
+- Reconciliation: compare our paid orders with the provider's settlement report every day.
+- Authenticate the lockers instead of trusting the network.
+- An OpenAPI spec and generated types for the frontend.
 - Push status to the screen (SSE or WebSocket) instead of polling.
-- `reserved_units` scans all open orders; at real volume, archive old orders and add a partial index for open ones.
-- Use a proper migration tool (Prisma or TypeORM) instead of the small runner here.
+- At higher volume, archive old orders so `reserved_units` stays fast.
+- Use Prisma or TypeORM migrations instead of the small runner here.
