@@ -1,0 +1,17 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pickup
+    ports:
+      - "5433:5432"   # for DBeaver / psql from your machine
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/pickup
+      WEBHOOK_SECRET: dev-secret-change-me
+    ports:
+      - "8080:3000"
+    depends_on: [db]
